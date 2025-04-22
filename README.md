@@ -19,7 +19,7 @@ A production-ready Caddy module that implements a reverse proxy using a headless
 To build Caddy with this module:
 
 ```bash
-xcaddy build --with github.com/yourusername/caddy-headless-proxy
+xcaddy build --with github.com/Her0x27/caddy-headless-proxy
 ```
 
 ## Caddyfile Syntax
@@ -69,8 +69,7 @@ example.com {
 - Consider running Caddy in a container or with limited privileges
 - Be careful when forwarding sensitive headers or cookies
 
-## Examples
-
+## Example 
 ### Basic Proxy
 
 ```
@@ -118,7 +117,7 @@ MIT License
 Let's also create a `go.mod` file:
 
 ```go:go.mod
-module github.com/yourusername/caddy-headless-proxy
+module github.com/Her0x27/caddy-headless-proxy
 
 go 1.18
 
