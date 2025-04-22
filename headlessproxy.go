@@ -32,6 +32,20 @@ func init() {
 // HeadlessProxy implements a reverse proxy that uses a headless browser
 // to fetch and process content from the target server.
 type HeadlessProxy struct {
+
+	metrics Metrics
+	// Resource optimizer
+	optimizer *ResourceOptimizer
+
+	// Browser monitor
+	monitor *BrowserMonitor
+
+	// Start time for uptime tracking
+	startTime time.Time
+
+	// Context for background tasks
+	ctx    context.Context
+	cancel context.CancelFunc
 	// The URL to proxy to
 	Upstream string `json:"upstream,omitempty"`
 
@@ -82,6 +96,475 @@ type cacheEntry struct {
 	Headers    http.Header
 	StatusCode int
 	Expiration time.Time
+}
+
+// Provision sets up the module.
+func (h *HeadlessProxy) Provision(ctx caddy.Context) error {
+	// Set default values
+	if h.Timeout <= 0 {
+		h.Timeout = 30
+	}
+
+	if h.UserAgent == "" {
+		h.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+	}
+
+	// Enable JS by default
+	if !h.EnableJS {
+		h.EnableJS = true
+	}
+
+	// Set default max browsers
+	if h.MaxBrowsers <= 0 {
+		h.MaxBrowsers = 5
+	}
+
+	// Initialize cache if caching is enabled
+	if h.CacheTTL > 0 {
+		h.cache = make(map[string]cacheEntry)
+	}
+
+	// Get a logger
+	h.logger = ctx.Logger().Named("headless_proxy").With(
+		zap.String("upstream", h.Upstream),
+	)
+
+	// Initialize metrics
+	h.initMetrics()
+
+	// Initialize resource optimizer
+	h.optimizer = NewResourceOptimizer(h)
+
+	// Initialize browser pool
+	h.browserPool = make([]*rod.Browser, 0, h.MaxBrowsers)
+	h.initBrowserPool()
+
+	// Initialize browser monitor
+	h.monitor = NewBrowserMonitor(h)
+	
+	// Create context for background tasks
+	h.ctx, h.cancel = context.WithCancel(context.Background())
+	
+	// Start browser monitoring
+	h.monitor.StartMonitoring(h.ctx)
+	
+	// Record start time for uptime tracking
+	h.startTime = time.Now()
+
+	h.logger.Info("headless proxy module initialized",
+		zap.Int("max_browsers", h.MaxBrowsers),
+		zap.Int("cache_ttl", h.CacheTTL),
+		zap.Bool("optimize_resources", h.OptimizeResources),
+		zap.Bool("compress_images", h.CompressImages),
+		zap.Bool("minify_content", h.MinifyContent),
+	)
+	return nil
+}
+
+// Cleanup cleans up the module's resources.
+func (h *HeadlessProxy) Cleanup() error {
+	// Cancel background tasks
+	if h.cancel != nil {
+		h.cancel()
+	}
+
+	h.browserPoolLock.Lock()
+	defer h.browserPoolLock.Unlock()
+
+	// Close all browsers in the pool
+	for _, browser := range h.browserPool {
+		err := browser.Close()
+		if err != nil {
+			h.logger.Error("failed to close browser during cleanup", zap.Error(err))
+		}
+		h.metrics.browserClosedTotal.Inc()
+	}
+
+	h.browserPool = nil
+	h.logger.Info("all browsers closed, cleanup complete")
+	return nil
+}
+
+// ServeHTTP implements the caddyhttp.MiddlewareHandler interface.
+func (h *HeadlessProxy) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	requestStart := time.Now()
+	
+	// Record request size
+	requestSize := 0
+	if r.ContentLength > 0 {
+		requestSize = int(r.ContentLength)
+	}
+	h.metrics.requestSize.WithLabelValues(r.Method).Observe(float64(requestSize))
+
+	// Check cache first
+	if content, headers, statusCode, found := h.getCachedResponse(r); found {
+		h.metrics.cacheHits.Inc()
+		h.logger.Info("serving cached response",
+			zap.String("path", r.URL.Path),
+			zap.Int("status", statusCode),
+			zap.Duration("response_time", time.Since(requestStart)),
+		)
+
+		for key, values := range headers {
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
+		}
+
+		w.WriteHeader(statusCode)
+		_, err := w.Write(content)
+		
+		// Record metrics
+		h.metrics.requestsTotal.WithLabelValues(r.Method, fmt.Sprintf("%d", statusCode)).Inc()
+		h.metrics.requestDuration.WithLabelValues(r.Method, fmt.Sprintf("%d", statusCode)).Observe(time.Since(requestStart).Seconds())
+		h.metrics.responseSize.WithLabelValues(r.Method, fmt.Sprintf("%d", statusCode)).Observe(float64(len(content)))
+		h.metrics.responseStatusCode.WithLabelValues(fmt.Sprintf("%d", statusCode)).Inc()
+		
+		return err
+	}
+	
+	h.metrics.cacheMisses.Inc()
+
+	// Get a browser from the pool
+	browser := h.getBrowser()
+	if browser == nil {
+		h.metrics.browserErrorsTotal.WithLabelValues("get_browser").Inc()
+		return fmt.Errorf("failed to get browser from pool")
+	}
+
+	// Make sure to return the browser to the pool when done
+	defer h.returnBrowser(browser)
+
+	// Create a context with timeout
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(h.Timeout)*time.Second)
+	defer cancel()
+
+	// Create the target URL by combining the upstream with the request path
+	targetURL := h.Upstream
+	if !strings.HasSuffix(targetURL, "/") && !strings.HasPrefix(r.URL.Path, "/") {
+		targetURL += "/"
+	}
+	targetURL += r.URL.Path
+	if r.URL.RawQuery != "" {
+		targetURL += "?" + r.URL.RawQuery
+	}
+
+	h.logger.Info("proxying request",
+		zap.String("method", r.Method),
+		zap.String("url", targetURL),
+	)
+
+	// Create a new browser page
+	page, err := browser.Page(proto.TargetCreateTarget{})
+	if err != nil {
+		h.metrics.browserErrorsTotal.WithLabelValues("create_page").Inc()
+		return fmt.Errorf("failed to create page: %v", err)
+	}
+	defer func() {
+		err := page.Close()
+		if err != nil {
+			h.logger.Error("failed to close page", zap.Error(err))
+		}
+	}()
+
+	// Set user agent
+	err = page.SetUserAgent(&proto.NetworkSetUserAgentOverride{
+		UserAgent: h.UserAgent,
+	})
+	if err != nil {
+		h.metrics.browserErrorsTotal.WithLabelValues("set_user_agent").Inc()
+		return fmt.Errorf("failed to set user agent: %v", err)
+	}
+
+	// Disable JavaScript if needed
+	if !h.EnableJS {
+		err = page.EvalOnNewDocument(`
+			Object.defineProperty(window, 'navigator', {
+				value: new Proxy(navigator, {
+					has: (target, key) => (key === 'plugins' || key === 'languages') ? false : key in target,
+					get: (target, key) => 
+						key === 'plugins' ? { length: 0 } : 
+						key === 'languages' ? ['en-US'] : 
+						key === 'userAgent' ? '` + h.UserAgent + `' : 
+						target[key]
+				})
+			});
+		`)
+		if err != nil {
+			h.metrics.browserErrorsTotal.WithLabelValues("disable_js").Inc()
+			return fmt.Errorf("failed to set JavaScript settings: %v", err)
+		}
+	}
+
+	// Forward cookies if enabled
+	if h.ForwardCookies {
+		cookies := r.Cookies()
+		for _, cookie := range cookies {
+			err = page.SetCookies(&proto.NetworkCookieParam{
+				Name:   cookie.Name,
+				Value:  cookie.Value,
+				Domain: cookie.Domain,
+				Path:   cookie.Path,
+			})
+			if err != nil {
+				h.logger.Error("failed to set cookie", zap.Error(err))
+				h.metrics.browserErrorsTotal.WithLabelValues("set_cookie").Inc()
+			}
+		}
+	}
+
+	// Set up response capture
+	var responseStatusCode int = http.StatusOK
+	responseHeaders := make(http.Header)
+	var responseContent []byte
+
+	// Start measuring browser render time
+	renderStart := time.Now()
+
+	// Handle different HTTP methods
+	switch r.Method {
+	case http.MethodGet:
+		// Navigate to the page
+		router := page.HijackRequests()
+		defer router.Stop()
+
+		// Intercept requests to modify headers
+		router.MustAdd("*", func(ctx *rod.Hijack) {
+			// Add forwarded headers
+			for _, header := range h.ForwardHeaders {
+				if value := r.Header.Get(header); value != "" {
+					ctx.Request.SetHeader(header, value)
+				}
+			}
+			
+			// Continue with the request
+			ctx.ContinueRequest(&proto.FetchContinueRequest{})
+		})
+		
+		go router.Run()
+
+		// Navigate to the page
+		err = page.Context(ctx).Navigate(targetURL)
+		if err != nil {
+			h.metrics.browserErrorsTotal.WithLabelValues("navigate").Inc()
+			return fmt.Errorf("failed to navigate to %s: %v", targetURL, err)
+		}
+
+		// Wait for the page to load
+		err = page.WaitNavigation(proto.PageLifecycleEventNameDOMContentLoaded)
+		if err != nil {
+			h.metrics.browserErrorsTotal.WithLabelValues("wait_navigation").Inc()
+			return fmt.Errorf("failed to wait for navigation: %v", err)
+		}
+
+		// Wait for network to be idle
+		err = page.WaitIdle(time.Second * 2)
+		if err != nil {
+			h.logger.Warn("timeout waiting for network idle", zap.Error(err))
+			h.metrics.browserErrorsTotal.WithLabelValues("wait_idle").Inc()
+		}
+
+		// Record browser render time
+		h.metrics.browserRenderTime.Observe(time.Since(renderStart).Seconds())
+
+		// Collect performance metrics if available
+		if perfMetrics, err := h.monitor.MonitorPagePerformance(page); err == nil {
+			h.logger.Debug("page performance metrics", zap.Any("metrics", perfMetrics))
+		}
+
+		// Optimize the page content if enabled
+		if h.OptimizeResources {
+			err = h.optimizer.OptimizePage(page)
+			if err != nil {
+				h.logger.Error("failed to optimize page", zap.Error(err))
+				h.metrics.browserErrorsTotal.WithLabelValues("optimize_page").Inc()
+			}
+		}
+
+		// Get the final HTML content
+		content, err := page.HTML()
+		if err != nil {
+			h.metrics.browserErrorsTotal.WithLabelValues("get_html").Inc()
+			return fmt.Errorf("failed to get page HTML: %v", err)
+		}
+		responseContent = []byte(content)
+
+		// Set content type header
+		responseHeaders.Set("Content-Type", "text/html; charset=utf-8")
+
+	case http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch:
+		// Read request body
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			h.metrics.browserErrorsTotal.WithLabelValues("read_body").Inc()
+			return fmt.Errorf("failed to read request body: %v", err)
+		}
+
+		// Prepare headers
+		headers := map[string]string{
+			"Content-Type": r.Header.Get("Content-Type"),
+		}
+
+		// Add forwarded headers
+		for _, header := range h.ForwardHeaders {
+			if value := r.Header.Get(header); value != "" {
+				headers[header] = value
+			}
+		}
+
+		// Execute fetch API to make the request
+		fetchScript := fmt.Sprintf(`
+			(async () => {
+				try {
+					const response = await fetch('%s', {
+						method: '%s',
+						headers: %s,
+						body: %s,
+						credentials: 'include',
+						redirect: 'follow'
+					});
+					
+					const text = await response.text();
+					const headers = {};
+					response.headers.forEach((value, key) => {
+						headers[key] = value;
+					});
+					
+					return {
+						status: response.status,
+						statusText: response.statusText,
+						headers: headers,
+						body: text
+					};
+				} catch (error) {
+					return {
+						error: error.toString(),
+						status: 500
+					};
+				}
+			})()
+		`, targetURL, r.Method, toJSONString(headers), toJSONString(string(body)))
+
+		var result map[string]interface{}
+		err = page.Eval(fetchScript).Unmarshal(&result)
+		if err != nil {
+			h.metrics.browserErrorsTotal.WithLabelValues("fetch_eval").Inc()
+			return fmt.Errorf("failed to execute fetch: %v", err)
+		}
+
+		// Record browser render time
+		h.metrics.browserRenderTime.Observe(time.Since(renderStart).Seconds())
+
+		// Check for errors
+		if errorMsg, ok := result["error"].(string); ok {
+			h.logger.Error("fetch API error", zap.String("error", errorMsg))
+			h.metrics.browserErrorsTotal.WithLabelValues("fetch_api").Inc()
+			w.WriteHeader(http.StatusBadGateway)
+			_, err = w.Write([]byte("Error communicating with upstream server"))
+			return err
+		}
+
+		// Set response headers
+		if headersMap, ok := result["headers"].(map[string]interface{}); ok {
+			for key, value := range headersMap {
+				responseHeaders.Set(key, fmt.Sprintf("%v", value))
+			}
+		}
+
+		// Set status code
+		if status, ok := result["status"].(float64); ok {
+			responseStatusCode = int(status)
+		}
+
+		// Set response body
+		if body, ok := result["body"].(string); ok {
+			responseContent = []byte(body)
+		}
+
+	default:
+		// For other methods, return method not allowed
+		responseStatusCode = http.StatusMethodNotAllowed
+		responseContent = []byte("Method not allowed")
+	}
+
+	// Get cookies from the page and set them in the response
+	if h.ForwardCookies {
+		pageCookies, err := page.Cookies([]string{})
+		if err == nil {
+			for _, cookie := range pageCookies {
+				cookieStr := fmt.Sprintf("%s=%s", cookie.Name, cookie.Value)
+				if cookie.Path != "" {
+					cookieStr += "; Path=" + cookie.Path
+				}
+				if cookie.Domain != "" {
+					cookieStr += "; Domain=" + cookie.Domain
+				}
+				if cookie.Expires != 0 {
+					expTime := time.Unix(int64(cookie.Expires), 0)
+					cookieStr += "; Expires=" + expTime.Format(time.RFC1123)
+				}
+				if cookie.Secure {
+					cookieStr += "; Secure"
+				}
+				if cookie.HTTPOnly {
+					cookieStr += "; HttpOnly"
+				}
+				responseHeaders.Add("Set-Cookie", cookieStr)
+			}
+		}
+		}
+
+	// Optimize response content if enabled
+	if h.MinifyContent && len(responseContent) > 0 {
+		contentType := responseHeaders.Get("Content-Type")
+		if contentType == "" {
+			contentType = http.DetectContentType(responseContent)
+		}
+		
+		optimizedContent, err := h.optimizer.OptimizeResponse(contentType, responseContent)
+		if err == nil {
+			responseContent = optimizedContent
+		} else {
+			h.logger.Warn("failed to optimize response content", 
+				zap.String("content_type", contentType),
+				zap.Error(err))
+		}
+	}
+
+	// Cache the response
+	h.setCachedResponse(r, responseContent, responseHeaders, responseStatusCode)
+
+	// Set headers in the response
+	for key, values := range responseHeaders {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+
+	// Set status code
+	w.WriteHeader(responseStatusCode)
+
+	// Write the content to the response
+	_, err = w.Write(responseContent)
+	if err != nil {
+		h.metrics.browserErrorsTotal.WithLabelValues("write_response").Inc()
+		return fmt.Errorf("failed to write response: %v", err)
+	}
+
+	// Record response metrics
+	responseTime := time.Since(requestStart)
+	h.metrics.requestsTotal.WithLabelValues(r.Method, fmt.Sprintf("%d", responseStatusCode)).Inc()
+	h.metrics.requestDuration.WithLabelValues(r.Method, fmt.Sprintf("%d", responseStatusCode)).Observe(responseTime.Seconds())
+	h.metrics.responseSize.WithLabelValues(r.Method, fmt.Sprintf("%d", responseStatusCode)).Observe(float64(len(responseContent)))
+	h.metrics.responseStatusCode.WithLabelValues(fmt.Sprintf("%d", responseStatusCode)).Inc()
+
+	h.logger.Info("request completed",
+		zap.Int("status", responseStatusCode),
+		zap.Int("content_length", len(responseContent)),
+		zap.Duration("response_time", responseTime),
+	)
+
+	return nil
 }
 
 // CaddyModule returns the Caddy module information.
